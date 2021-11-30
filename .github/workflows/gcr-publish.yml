@@ -1,0 +1,105 @@
+name: Publish to GCR
+
+on:
+
+  workflow_run:
+    #workflows: ["Unit Test"]
+    branches: [master]
+    types:
+      - completed
+
+  release:
+    types: [published]
+
+  workflow_dispatch:
+    inputs:
+      gcr:
+        description: 'Deploy GCR'
+        default: 'Global'
+        required: true
+      tag:
+        description: 'Custom tag to add'
+        default: ''
+        required: false
+
+env:
+  PROJECT_ID: ${{ secrets.GCR_PROJECT }}
+  IMAGE_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-20.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Vars
+      id: vars
+      run: |
+        SHA_SHORT=$(git rev-parse --short=7 ${{ github.sha }})
+        echo ::set-output name=sha_short::$SHA_SHORT
+        echo ::set-output name=gcr_registry::"gcr.io/$PROJECT_ID/$IMAGE_NAME"
+        echo ::set-output name=dockerhub_registry::"inceptionxr/$IMAGE_NAME"
+        if [[ ${{ github.ref }} == refs/tags/* ]]; then
+          echo ::set-output name=application_version::"${GITHUB_REF#refs/*/}-${SHORT_SHA}"
+          echo ::set-output name=image_tag::"${GITHUB_REF#refs/*/}"
+        elif [[ ! -z "${{ github.event.inputs.tag }}" ]]; then
+          echo ::set-output name=application_version::"0.0.0-${{ github.event.inputs.tag }}"
+          echo ::set-output name=image_tag::"${{ github.event.inputs.tag }}"
+        else
+          echo ::set-output name=application_version::"0.0.0-${SHORT_SHA}"
+          echo ::set-output name=image_tag::"$SHA_SHORT"
+        fi
+
+    - name: Build
+      env:
+        APPLICATION_VERSION: ${{ steps.vars.outputs.application_version }}
+        GCR_REGISTRY: ${{ steps.vars.outputs.gcr_registry }}
+        DOCKERHUB_REGISTRY: ${{ steps.vars.outputs.dockerhub_registry }}
+        IMAGE_TAG: ${{ steps.vars.outputs.image_tag }}
+      run: |
+        docker build \
+          --tag "$GCR_REGISTRY:$IMAGE_TAG" \
+          --tag "$GCR_REGISTRY:latest" \
+          --tag "$DOCKERHUB_REGISTRY:$IMAGE_TAG" \
+          --tag "$DOCKERHUB_REGISTRY:latest" \
+          --build-arg APPLICATION_VERSION="${APPLICATION_VERSION}" \
+          .
+
+    - name: Setup gcloud CLI
+      uses: google-github-actions/setup-gcloud@v0.2.0
+      with:
+        service_account_key: ${{ secrets.GCR_SA_KEY }}
+        project_id: ${{ secrets.GCR_PROJECT }}
+    - run: |-
+        gcloud --quiet auth configure-docker
+
+    - name: Push GCR
+      env:
+        GCR_REGISTRY: ${{ steps.vars.outputs.gcr_registry }}
+        IMAGE_TAG: ${{ steps.vars.outputs.image_tag }}
+      run: |-
+        docker push $GCR_REGISTRY:$IMAGE_TAG
+        docker push $GCR_REGISTRY:latest
+
+    ### Push only release versions to dockerhub
+    - name: Push dockerhub
+      if: startsWith(github.ref, 'refs/tags/v') == true
+      env:
+        DOCKERHUB_REGISTRY: ${{ steps.vars.outputs.dockerhub_registry }}
+        IMAGE_TAG: ${{ steps.vars.outputs.image_tag }}
+      run: |-
+        docker login -u ${{ secrets.CI_GITHUB_USER }}  -p ${{ secrets.CI_GITHUB_TOKEN }}
+        docker push $DOCKERHUB_REGISTRY:$IMAGE_TAG
+        docker push $DOCKERHUB_REGISTRY:latest
+
+    - name: Rollout Image Development
+      if: startsWith(github.ref, 'refs/tags/v') != true
+      uses: peter-evans/repository-dispatch@v1
+      with:
+        token: ${{ secrets.GH_DISPATCH_PAT }}
+        repository: InceptionXR/bookful-k8s-config
+        event-type: tracking-proxy-service-deploy
+        client-payload: '{"image_tag": "${{ steps.vars.outputs.image_tag }}"}'
