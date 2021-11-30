@@ -3,7 +3,7 @@ name: Publish to GCR
 on:
 
   workflow_run:
-    #workflows: ["Unit Test"]
+    workflows: ["Unit Test"]
     branches: [master]
     types:
       - completed
